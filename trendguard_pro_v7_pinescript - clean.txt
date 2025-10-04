@@ -1,0 +1,511 @@
+//@version=6
+strategy("TrendGuard Pro v7 - PropMaster", 
+         overlay=true, 
+         initial_capital=10000,
+         default_qty_type=strategy.percent_of_equity,
+         default_qty_value=0.30,
+         commission_type=strategy.commission.percent,
+         commission_value=0.05,
+         slippage=1,
+         pyramiding=1)
+
+// ==================== INPUT PARAMETERS ====================
+
+// --- Risk Management Core ---
+grp_risk = "Risk Management"
+base_risk_pct = input.float(0.30, "Base Risk %", minval=0.1, maxval=5.0, step=0.05, group=grp_risk)
+max_daily_loss_pct = input.float(5.0, "Max Daily Loss %", minval=1.0, maxval=20.0, step=0.5, group=grp_risk)
+max_total_dd_pct = input.float(10.0, "Max Total Drawdown %", minval=1.0, maxval=30.0, step=0.5, group=grp_risk)
+max_consec_losses = input.int(5, "Max Consecutive Losses", minval=1, maxval=20, group=grp_risk)
+cooldown_minutes_after_loss = input.int(30, "Cooldown Minutes After Loss", minval=0, maxval=240, group=grp_risk)
+max_open_positions = input.int(1, "Max Open Positions Per Symbol", minval=1, maxval=10, group=grp_risk)
+close_all_on_daily_loss = input.bool(true, "Close All If Daily Loss Hit", group=grp_risk)
+
+// --- Account/Prop Presets ---
+grp_presets = "Account & Prop Presets"
+account_mode = input.string("Custom", "Account Mode", options=["Custom", "Normal", "Prop Challenge", "Prop Funded"], group=grp_presets)
+prop_preset = input.string("Custom", "Prop Firm Preset", options=["Custom", "FTMO 2025", "MFF 2025", "FundedNext 2025"], group=grp_presets)
+daily_loss_buffer_pct = input.float(0.0, "Daily Loss Buffer %", minval=0.0, maxval=2.0, step=0.1, group=grp_presets)
+
+// --- Regime Detection ---
+grp_regime = "Regime Detection"
+adx_period = input.int(14, "ADX Period", minval=5, maxval=50, group=grp_regime)
+adx_trend_thresh = input.int(25, "ADX Trend Threshold", minval=15, maxval=40, group=grp_regime)
+adx_range_thresh = input.int(20, "ADX Range Threshold", minval=10, maxval=30, group=grp_regime)
+atr_period = input.int(14, "ATR Period", minval=5, maxval=50, group=grp_regime)
+
+// --- Trend Strategy ---
+grp_trend = "Trend Strategy"
+tf_ema_fast = input.int(50, "Fast EMA", minval=5, maxval=200, group=grp_trend)
+tf_ema_slow = input.int(200, "Slow EMA", minval=20, maxval=500, group=grp_trend)
+tf_stop_atr_mult = input.float(2.0, "Stop Loss ATR Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grp_trend)
+tf_tp_rr = input.float(1.5, "Take Profit Risk:Reward", minval=0.5, maxval=5.0, step=0.1, group=grp_trend)
+
+// --- Mean Reversion Strategy ---
+grp_mr = "Mean Reversion Strategy"
+mr_rsi_period = input.int(14, "RSI Period", minval=5, maxval=50, group=grp_mr)
+mr_rsi_buy = input.int(30, "RSI Buy Level", minval=10, maxval=40, group=grp_mr)
+mr_rsi_sell = input.int(70, "RSI Sell Level", minval=60, maxval=90, group=grp_mr)
+mr_bb_period = input.int(20, "Bollinger Bands Period", minval=5, maxval=100, group=grp_mr)
+mr_bb_dev = input.float(2.0, "BB Std Deviation", minval=1.0, maxval=4.0, step=0.1, group=grp_mr)
+mr_stop_atr_mult = input.float(1.8, "Stop Loss ATR Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grp_mr)
+mr_tp_rr = input.float(1.2, "Take Profit Risk:Reward", minval=0.5, maxval=5.0, step=0.1, group=grp_mr)
+
+// --- Session Filters ---
+grp_sess = "Session Filters (GMT)"
+use_session_filter = input.bool(true, "Use Session Filter", group=grp_sess)
+broker_gmt_offset = input.int(0, "Broker GMT Offset Hours", minval=-12, maxval=12, group=grp_sess)
+use_tokyo = input.bool(false, "Trade Tokyo Session", group=grp_sess)
+tokyo_start = input.session("0000-0800", "Tokyo Session", group=grp_sess)
+use_london = input.bool(true, "Trade London Session", group=grp_sess)
+london_start = input.session("0700-1600", "London Session", group=grp_sess)
+use_ny = input.bool(true, "Trade NY Session", group=grp_sess)
+ny_start = input.session("1230-2100", "NY Session", group=grp_sess)
+allow_overlap_boost = input.bool(true, "Allow London/NY Overlap Boost", group=grp_sess)
+overlap_mult = input.float(1.25, "Overlap Size Multiplier", minval=1.0, maxval=2.0, step=0.05, group=grp_sess)
+
+// --- Day of Week Optimizer ---
+grp_dow = "Day of Week Optimizer"
+use_dow_opt = input.bool(true, "Use Day of Week Optimizer", group=grp_dow)
+mon_mult = input.float(0.85, "Monday Multiplier", minval=0.5, maxval=1.5, step=0.05, group=grp_dow)
+tue_mult = input.float(1.05, "Tuesday Multiplier", minval=0.5, maxval=1.5, step=0.05, group=grp_dow)
+wed_mult = input.float(1.00, "Wednesday Multiplier", minval=0.5, maxval=1.5, step=0.05, group=grp_dow)
+thu_mult = input.float(0.95, "Thursday Multiplier", minval=0.5, maxval=1.5, step=0.05, group=grp_dow)
+fri_mult = input.float(0.85, "Friday Multiplier", minval=0.5, maxval=1.5, step=0.05, group=grp_dow)
+
+// --- Execution Guards ---
+grp_guards = "Execution Guards"
+use_spread_guard = input.bool(false, "Use Spread Guard", group=grp_guards)
+max_spread_points = input.int(25, "Max Spread Points", minval=5, maxval=100, group=grp_guards)
+use_signal_cooldown = input.bool(false, "Use Signal Cooldown", group=grp_guards)
+signal_cooldown_min = input.int(15, "Signal Cooldown Minutes", minval=5, maxval=120, group=grp_guards)
+
+// --- Position Management ---
+grp_mgmt = "Position Management"
+use_breakeven = input.bool(false, "Use Break-Even", group=grp_mgmt)
+be_trigger_atr = input.float(1.0, "BE Trigger (ATR multiplier)", minval=0.5, maxval=3.0, step=0.1, group=grp_mgmt)
+be_lock_points = input.int(5, "BE Lock Points", minval=0, maxval=50, group=grp_mgmt)
+
+use_partial_tp = input.bool(false, "Use Partial Take Profit", group=grp_mgmt)
+partial1_pct = input.float(50.0, "Partial 1 Close %", minval=10.0, maxval=90.0, step=5.0, group=grp_mgmt)
+partial1_atr = input.float(1.0, "Partial 1 ATR Target", minval=0.5, maxval=5.0, step=0.1, group=grp_mgmt)
+partial2_pct = input.float(25.0, "Partial 2 Close %", minval=10.0, maxval=90.0, step=5.0, group=grp_mgmt)
+partial2_atr = input.float(2.0, "Partial 2 ATR Target", minval=0.5, maxval=5.0, step=0.1, group=grp_mgmt)
+
+trail_mode = input.string("None", "Trailing Stop Mode", options=["None", "ATR", "Chandelier"], group=grp_mgmt)
+trail_atr_period = input.int(14, "Trail ATR Period", minval=5, maxval=50, group=grp_mgmt)
+trail_atr_mult = input.float(2.0, "Trail ATR Multiplier", minval=0.5, maxval=5.0, step=0.1, group=grp_mgmt)
+
+// --- MTF Filter ---
+grp_mtf = "Multi-Timeframe Filter"
+use_mtf_filter = input.bool(false, "Use MTF Filter", group=grp_mtf)
+mtf_timeframe = input.timeframe("240", "MTF Timeframe", group=grp_mtf)
+mtf_ema_fast = input.int(50, "MTF Fast EMA", minval=5, maxval=200, group=grp_mtf)
+mtf_ema_slow = input.int(200, "MTF Slow EMA", minval=20, maxval=500, group=grp_mtf)
+
+// --- Session Edges ---
+grp_edges = "Session Edge Protection"
+block_friday_close = input.int(60, "Block Friday Close (Minutes)", minval=0, maxval=240, group=grp_edges)
+block_weekend_gap = input.int(30, "Block Weekend Gap (Minutes)", minval=0, maxval=240, group=grp_edges)
+
+// --- Display ---
+grp_display = "Display Options"
+show_signals = input.bool(true, "Show Entry Signals", group=grp_display)
+show_regime = input.bool(true, "Show Regime Label", group=grp_display)
+show_table = input.bool(true, "Show Info Table", group=grp_display)
+
+// ==================== STATE VARIABLES ====================
+var float day_start_equity = strategy.initial_capital
+var float peak_equity = strategy.initial_capital
+var int consec_losses = 0
+var int last_loss_bar = 0
+var int last_buy_signal_bar = 0
+var int last_sell_signal_bar = 0
+var bool daily_loss_breached = false
+var bool total_dd_breached = false
+var bool partial1_taken = false
+var bool partial2_taken = false
+
+// ==================== HELPER FUNCTIONS ====================
+
+// Apply preset overrides
+get_effective_daily_loss() =>
+    float result = max_daily_loss_pct
+    if account_mode == "Normal"
+        result := 999.0
+    else if account_mode == "Prop Challenge" or account_mode == "Prop Funded"
+        result := 5.0
+    
+    if prop_preset == "FTMO 2025"
+        result := 5.0
+    else if prop_preset == "MFF 2025"
+        result := 5.0
+    else if prop_preset == "FundedNext 2025"
+        result := 4.0
+    
+    if daily_loss_buffer_pct > 0.0 and result < 999.0
+        result := math.max(0.0, result - daily_loss_buffer_pct)
+    result
+
+get_effective_total_dd() =>
+    float result = max_total_dd_pct
+    if account_mode == "Normal"
+        result := 999.0
+    else if account_mode == "Prop Challenge" or account_mode == "Prop Funded"
+        result := 10.0
+    
+    if prop_preset == "FTMO 2025"
+        result := 10.0
+    else if prop_preset == "MFF 2025"
+        result := 12.0
+    else if prop_preset == "FundedNext 2025"
+        result := 8.0
+    result
+
+// Get day of week multiplier
+get_dow_multiplier() =>
+    float mult = 1.0
+    if use_dow_opt
+        int dow = dayofweek(time)
+        if dow == dayofweek.monday
+            mult := mon_mult
+        else if dow == dayofweek.tuesday
+            mult := tue_mult
+        else if dow == dayofweek.wednesday
+            mult := wed_mult
+        else if dow == dayofweek.thursday
+            mult := thu_mult
+        else if dow == dayofweek.friday
+            mult := fri_mult
+    mult
+
+// Session check with multiplier
+get_session_multiplier() =>
+    float mult = 1.0
+    if not use_session_filter
+        mult := 1.0
+    else
+        bool in_tokyo = false
+        bool in_london = false
+        bool in_ny = false
+        
+        if use_tokyo
+            in_tokyo := not na(time(timeframe.period, tokyo_start, "GMT"))
+            
+        if use_london
+            in_london := not na(time(timeframe.period, london_start, "GMT"))
+            
+        if use_ny
+            in_ny := not na(time(timeframe.period, ny_start, "GMT"))
+        
+        // Must be in at least one session
+        if not (in_tokyo or in_london or in_ny)
+            mult := 0.0
+        else
+            // Apply base multipliers
+            if in_tokyo
+                mult := mult * 0.60
+            if in_london
+                mult := mult * 1.00
+            if in_ny
+                mult := mult * 1.00
+            
+            // Overlap boost
+            if allow_overlap_boost and in_london and in_ny
+                mult := mult * overlap_mult
+    mult
+
+// Check if blocked by session edges
+is_blocked_by_edges() =>
+    bool blocked = false
+    if use_session_filter
+        int dow = dayofweek(time)
+        int min_of_day = hour(time) * 60 + minute(time)
+        
+        // Friday close
+        if dow == dayofweek.friday and block_friday_close > 0
+            if min_of_day >= (24 * 60 - block_friday_close)
+                blocked := true
+        
+        // Weekend gap
+        if block_weekend_gap > 0
+            if (dow == dayofweek.sunday or dow == dayofweek.monday) and min_of_day < block_weekend_gap
+                blocked := true
+    blocked
+
+// Check cooldown
+is_cooldown_active(int dir) =>
+    bool active = false
+    if use_signal_cooldown
+        int cooldown_bars = signal_cooldown_min
+        if dir > 0 and bar_index - last_buy_signal_bar < cooldown_bars
+            active := true
+        if dir < 0 and bar_index - last_sell_signal_bar < cooldown_bars
+            active := true
+    active
+
+// ==================== INDICATORS ====================
+
+// ADX
+[diPlus, diMinus, adx_val] = ta.dmi(adx_period, adx_period)
+
+// ATR
+atr_val = ta.atr(atr_period)
+
+// EMAs (Trend)
+ema_fast = ta.ema(close, tf_ema_fast)
+ema_slow = ta.ema(close, tf_ema_slow)
+
+// RSI (Mean Reversion)
+rsi_val = ta.rsi(close, mr_rsi_period)
+
+// Bollinger Bands (Mean Reversion)
+[bb_mid, bb_upper, bb_lower] = ta.bb(close, mr_bb_period, mr_bb_dev)
+
+// MTF Filter
+mtf_ema_fast_val = use_mtf_filter ? request.security(syminfo.tickerid, mtf_timeframe, ta.ema(close, mtf_ema_fast), gaps=barmerge.gaps_off) : 0.0
+mtf_ema_slow_val = use_mtf_filter ? request.security(syminfo.tickerid, mtf_timeframe, ta.ema(close, mtf_ema_slow), gaps=barmerge.gaps_off) : 0.0
+
+// ==================== REGIME DETECTION ====================
+
+string regime = adx_val >= adx_trend_thresh ? "TREND" : adx_val <= adx_range_thresh ? "RANGE" : "CHAOS"
+
+// ==================== SIGNAL GENERATION ====================
+
+// MTF Alignment Check
+bool mtf_aligned_long = not use_mtf_filter or mtf_ema_fast_val > mtf_ema_slow_val
+bool mtf_aligned_short = not use_mtf_filter or mtf_ema_fast_val < mtf_ema_slow_val
+
+// Trend Signals
+bool trend_long = ema_fast > ema_slow and close > ema_fast and mtf_aligned_long
+bool trend_short = ema_fast < ema_slow and close < ema_fast and mtf_aligned_short
+float trend_stop_dist = tf_stop_atr_mult * atr_val
+float trend_rr = tf_tp_rr
+
+// Mean Reversion Signals
+bool mr_long = rsi_val <= mr_rsi_buy and close <= bb_lower and mtf_aligned_long
+bool mr_short = rsi_val >= mr_rsi_sell and close >= bb_upper and mtf_aligned_short
+float mr_stop_dist = mr_stop_atr_mult * atr_val
+float mr_rr = mr_tp_rr
+
+// Select signals based on regime
+bool long_signal = regime == "TREND" ? trend_long : regime == "RANGE" ? mr_long : false
+bool short_signal = regime == "TREND" ? trend_short : regime == "RANGE" ? mr_short : false
+float stop_dist = regime == "TREND" ? trend_stop_dist : mr_stop_dist
+float tp_rr = regime == "TREND" ? trend_rr : mr_rr
+
+// ==================== RISK MANAGEMENT ====================
+
+// Reset daily equity at new day
+bool new_day = ta.change(dayofmonth(time)) != 0
+if new_day
+    day_start_equity := strategy.equity
+    daily_loss_breached := false
+
+// Update peak equity
+if strategy.equity > peak_equity
+    peak_equity := strategy.equity
+
+// Calculate drawdowns
+float daily_dd_pct = day_start_equity > 0 ? ((day_start_equity - strategy.equity) / day_start_equity) * 100 : 0.0
+float total_dd_pct = peak_equity > 0 ? ((peak_equity - strategy.equity) / peak_equity) * 100 : 0.0
+
+// Check limits
+float eff_daily_loss = get_effective_daily_loss()
+float eff_total_dd = get_effective_total_dd()
+
+if daily_dd_pct >= eff_daily_loss and not daily_loss_breached
+    daily_loss_breached := true
+    if close_all_on_daily_loss
+        strategy.close_all("Daily Loss Breach")
+
+if total_dd_pct >= eff_total_dd
+    total_dd_breached := true
+
+// Cooldown after consecutive losses
+bool cooldown_active_loss = consec_losses >= max_consec_losses or (cooldown_minutes_after_loss > 0 and bar_index - last_loss_bar < cooldown_minutes_after_loss)
+
+// Overall risk check
+bool risk_ok = not daily_loss_breached and not total_dd_breached and not cooldown_active_loss
+
+// ==================== POSITION SIZING ====================
+
+// Calculate effective risk
+float sess_mult = get_session_multiplier()
+float dow_mult = get_dow_multiplier()
+float eff_risk_pct = base_risk_pct * sess_mult * dow_mult
+
+// Session filter
+bool session_ok = sess_mult > 0.0
+
+// ==================== ENTRY CONDITIONS ====================
+
+// Guards
+bool spread_ok = not use_spread_guard
+bool edge_ok = not is_blocked_by_edges()
+bool cooldown_long_ok = not is_cooldown_active(1)
+bool cooldown_short_ok = not is_cooldown_active(-1)
+bool positions_ok = strategy.opentrades < max_open_positions
+
+// Final entry conditions
+bool can_enter_long = long_signal and risk_ok and session_ok and spread_ok and edge_ok and cooldown_long_ok and positions_ok
+bool can_enter_short = short_signal and risk_ok and session_ok and spread_ok and edge_ok and cooldown_short_ok and positions_ok
+
+// ==================== ENTRY EXECUTION ====================
+
+if can_enter_long
+    float stop_price = close - stop_dist
+    float tp_price = close + (stop_dist * tp_rr)
+    strategy.entry("Long", strategy.long, comment="TG7-L")
+    strategy.exit("Long Exit", "Long", stop=stop_price, limit=tp_price)
+    last_buy_signal_bar := bar_index
+    partial1_taken := false
+    partial2_taken := false
+
+if can_enter_short
+    float stop_price = close + stop_dist
+    float tp_price = close - (stop_dist * tp_rr)
+    strategy.entry("Short", strategy.short, comment="TG7-S")
+    strategy.exit("Short Exit", "Short", stop=stop_price, limit=tp_price)
+    last_sell_signal_bar := bar_index
+    partial1_taken := false
+    partial2_taken := false
+
+// ==================== POSITION MANAGEMENT ====================
+
+// Track closed positions for consecutive losses
+if strategy.closedtrades > strategy.closedtrades[1]
+    float last_pnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if last_pnl < 0
+        consec_losses := consec_losses + 1
+        last_loss_bar := bar_index
+    else if last_pnl > 0
+        consec_losses := 0
+
+// Break-Even Management
+if use_breakeven and strategy.position_size != 0
+    float entry_price = strategy.opentrades.entry_price(0)
+    float be_trigger_dist = be_trigger_atr * atr_val
+    
+    if strategy.position_size > 0
+        float profit_dist = close - entry_price
+        if profit_dist >= be_trigger_dist
+            float new_stop = entry_price + (be_lock_points * syminfo.mintick)
+            strategy.exit("Long Exit", "Long", stop=new_stop)
+    
+    if strategy.position_size < 0
+        float profit_dist = entry_price - close
+        if profit_dist >= be_trigger_dist
+            float new_stop = entry_price - (be_lock_points * syminfo.mintick)
+            strategy.exit("Short Exit", "Short", stop=new_stop)
+
+// Partial Take Profit
+if use_partial_tp and strategy.position_size != 0
+    float entry_price = strategy.opentrades.entry_price(0)
+    
+    float tp1_dist = partial1_atr * atr_val
+    float tp2_dist = partial2_atr * atr_val
+    
+    if strategy.position_size > 0
+        float profit_dist = close - entry_price
+        if not partial1_taken and profit_dist >= tp1_dist
+            strategy.close("Long", qty_percent=partial1_pct, comment="TP1")
+            partial1_taken := true
+        if not partial2_taken and profit_dist >= tp2_dist
+            strategy.close("Long", qty_percent=partial2_pct, comment="TP2")
+            partial2_taken := true
+    
+    if strategy.position_size < 0
+        float profit_dist = entry_price - close
+        if not partial1_taken and profit_dist >= tp1_dist
+            strategy.close("Short", qty_percent=partial1_pct, comment="TP1")
+            partial1_taken := true
+        if not partial2_taken and profit_dist >= tp2_dist
+            strategy.close("Short", qty_percent=partial2_pct, comment="TP2")
+            partial2_taken := true
+
+// Trailing Stop
+if trail_mode != "None" and strategy.position_size != 0
+    float trail_atr = ta.atr(trail_atr_period)
+    float trail_dist = trail_atr_mult * trail_atr
+    
+    if trail_mode == "ATR"
+        if strategy.position_size > 0
+            float trail_stop = close - trail_dist
+            strategy.exit("Long Exit", "Long", stop=trail_stop)
+        if strategy.position_size < 0
+            float trail_stop = close + trail_dist
+            strategy.exit("Short Exit", "Short", stop=trail_stop)
+    
+    else if trail_mode == "Chandelier"
+        int lookback = math.max(14, trail_atr_period)
+        if strategy.position_size > 0
+            float highest_high = ta.highest(high, lookback)
+            float trail_stop = highest_high - trail_dist
+            strategy.exit("Long Exit", "Long", stop=trail_stop)
+        if strategy.position_size < 0
+            float lowest_low = ta.lowest(low, lookback)
+            float trail_stop = lowest_low + trail_dist
+            strategy.exit("Short Exit", "Short", stop=trail_stop)
+
+// ==================== VISUALIZATION ====================
+
+// Plot EMAs
+plot(ema_fast, "EMA Fast", color=color.blue, linewidth=1)
+plot(ema_slow, "EMA Slow", color=color.red, linewidth=2)
+
+// Plot BB
+plot(bb_upper, "BB Upper", color=color.gray)
+plot(bb_lower, "BB Lower", color=color.gray)
+
+// Entry signals
+plotshape(show_signals and can_enter_long, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(show_signals and can_enter_short, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// Regime label
+if show_regime and barstate.islast
+    color label_color = regime == "TREND" ? color.blue : regime == "RANGE" ? color.orange : color.gray
+    label.new(bar_index, high, regime, style=label.style_label_down, color=label_color, textcolor=color.white)
+
+// Info Table
+if show_table and barstate.islast
+    var table info_table = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80), border_width=1)
+    
+    table.cell(info_table, 0, 0, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 0, regime, text_color=color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 1, "Daily DD", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 1, str.tostring(daily_dd_pct, "#.##") + "%", 
+               text_color=daily_dd_pct >= eff_daily_loss * 0.8 ? color.red : color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 2, "Total DD", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 2, str.tostring(total_dd_pct, "#.##") + "%", 
+               text_color=total_dd_pct >= eff_total_dd * 0.8 ? color.red : color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 3, "Consec Loss", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 3, str.tostring(consec_losses), 
+               text_color=consec_losses >= max_consec_losses ? color.red : color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 4, "Session Mult", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 4, str.tostring(sess_mult, "#.##"), text_color=color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 5, "DoW Mult", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 5, str.tostring(dow_mult, "#.##"), text_color=color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 6, "Eff Risk %", text_color=color.white, text_size=size.small)
+    table.cell(info_table, 1, 6, str.tostring(eff_risk_pct, "#.###"), text_color=color.white, text_size=size.small)
+    
+    table.cell(info_table, 0, 7, "Status", text_color=color.white, text_size=size.small)
+    string status_text = risk_ok and session_ok ? "ACTIVE" : "BLOCKED"
+    color status_color = risk_ok and session_ok ? color.green : color.red
+    table.cell(info_table, 1, 7, status_text, text_color=status_color, text_size=size.small)
+
+// Session background colors
+bgcolor(use_session_filter and not na(time(timeframe.period, tokyo_start, "GMT")) ? color.new(color.yellow, 95) : na, title="Tokyo")
+bgcolor(use_session_filter and not na(time(timeframe.period, london_start, "GMT")) ? color.new(color.blue, 95) : na, title="London")
+bgcolor(use_session_filter and not na(time(timeframe.period, ny_start, "GMT")) ? color.new(color.purple, 95) : na, title="NY")
+
+// ==================== ALERTS ====================
+
+alertcondition(can_enter_long, "Long Entry", "TG7: Long signal - {{ticker}} @ {{close}}")
+alertcondition(can_enter_short, "Short Entry", "TG7: Short signal - {{ticker}} @ {{close}}")
